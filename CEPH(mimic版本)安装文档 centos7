@@ -1,0 +1,170 @@
+修改主机名hostname
+hostnamectl --static set-hostname admin
+hostnamectl --static set-hostname node1
+hostnamectl --static set-hostname node2
+hostnamectl --static set-hostname -node3
+
+echo '
+172.16.35.119 admin
+172.16.35.36 node1
+172.16.35.37 node2
+172.16.35.81 node3
+'>>/etc/hosts
+
+校对系统时钟
+
+yum install ntp ntpdate ntp-doc -y
+ntpdate 0.cn.pool.ntp.org
+
+关闭防火墙
+systemctl stop firewalld.service
+systemctl disable firewalld.service
+
+阿里源
+rm -f /etc/yum.repos.d/*
+wget -O /etc/yum.repos.d/CentOS-Base.repo http://mirrors.aliyun.com/repo/Centos-7.repo
+wget -O /etc/yum.repos.d/epel.repo http://mirrors.aliyun.com/repo/epel-7.repo
+sed -i '/aliyuncs.com/d' /etc/yum.repos.d/*.repo #删除阿里内网地址
+##### 创建ceph源
+echo '#阿里ceph源
+[ceph-noarch]
+name=Ceph noarch packages
+baseurl=http://mirrors.163.com/ceph/rpm-mimic/el7/noarch
+enabled=1
+gpgcheck=1
+priority=1
+type=rpm-md
+gpgkey=http://mirrors.163.com/ceph/keys/release.asc
+'>/etc/yum.repos.d/ceph.repo
+
+yum clean all && yum makecache #生成缓存
+
+指定安装版本的源
+
+cat <<EOF >> ~/.bashrc
+export CEPH_DEPLOY_REPO_URL=http://mirrors.163.com/ceph/rpm-mimic/el7
+export CEPH_DEPLOY_GPG_URL=http://mirrors.163.com/ceph/keys/release.asc
+EOF
+source ~/.bashrc
+
+重装清除配置
+清除ceph存储
+清除安装包
+ceph-deploy purge ceph-node1 ceph-node2 ceph-node3
+清除配置信息
+ceph-deploy purgedata ceph-node1 ceph-node2 ceph-node3
+ceph-deploy forgetkeys
+每个节点删除残留的配置文件
+sudo rm -rf /var/lib/ceph/osd/*
+sudo rm -rf /var/lib/ceph/mon/*
+sudo rm -rf /var/lib/ceph/mds/*
+sudo rm -rf /var/lib/ceph/bootstrap-mds/*
+sudo rm -rf /var/lib/ceph/bootstrap-osd/*
+sudo rm -rf /var/lib/ceph/bootstrap-mon/*
+sudo rm -rf /var/lib/ceph/tmp/*
+sudo rm -rf /etc/ceph/*
+sudo rm -rf /var/run/ceph/*
+# 重做时磁盘也要重写做
+ceph-volume lvm zap /dev/vdb --destroy
+#重启各个服务
+systemctl stop ceph-mon@ceph-node1
+systemctl stop ceph-mgr@ceph-node1
+systemctl stop ceph-osd@ceph-node1
+# 重推配置到各机器
+ceph-deploy --overwrite-conf config push ceph-admin ceph-node{1,2,3}
+
+
+生成ssh秘钥文件，并且分发给所有客户端
+ssh-keygen -t rsa
+ssh-copy-id -i ~/.ssh/id_rsa.pub IP
+
+安装ceph-deploy配置工具
+yum install -y ceph-deploy
+
+创建配置目录
+mkdir /etc/ceph && cd /etc/ceph/
+
+初始化mon配置
+ceph-deploy new --public-network 172.16.35.0/24 node{1,2,3}
+
+
+配置网络,单网卡忽略 修改冗余份数为2，日志大小2G
+echo '
+mon_clock_drift_allowed = 2    
+osd_journal_size = 4086
+osd_pool_default_pg_num = 128
+osd_pool_default_pgp_num = 128
+osd pool default size = 2
+osd pool default min size = 1
+rbd_default_features = 1
+client_quota = true
+'>>./ceph.conf
+
+
+安装CEPH
+ceph-deploy install --release mimic ceph-admin node{1,2,3}
+
+初始化monitor和key
+cd /etc/ceph/
+ceph-deploy --overwrite-conf mon create-initial
+
+分发拷贝配置及密钥
+chmod 644 /etc/ceph/ceph.client.admin.keyring
+ceph-deploy admin ceph-admin node{1,2,3}
+
+创建存储节点
+lsblk 查看磁盘
+
+清空磁盘
+
+ceph-deploy disk zap node1 /dev/sdb
+ceph-deploy disk zap node2 /dev/sdb
+ceph-deploy disk zap node3 /dev/sdb
+
+查看可用磁盘
+ceph-deploy disk list node1
+ceph-deploy disk list node2
+ceph-deploy disk list node3
+
+创建osd
+ceph-deploy --overwrite-conf osd create node1 --data /dev/sdb 
+ceph-deploy --overwrite-conf osd create node2 --data /dev/sdb 
+ceph-deploy --overwrite-conf osd create node3 --data /dev/sdb
+
+创建 ceph mgr 管理进程服务
+ceph-deploy --overwrite-conf mgr create node1
+ceph-deploy --overwrite-conf mgr create node2
+ceph-deploy --overwrite-conf mgr create node3
+
+创建mon
+ceph-deploy --overwrite-conf mon create node1
+ceph-deploy --overwrite-conf admin node1
+ceph-deploy --overwrite-conf mon create node2
+ceph-deploy --overwrite-conf admin node2
+ceph-deploy --overwrite-conf mon create node3
+ceph-deploy --overwrite-conf admin node3
+
+启用dashboard
+ceph mgr module enable dashboard
+# 设置dashboard的ip和端口
+ceph config-key put mgr/dashboard/server_addr ceph-node1
+ceph config-key put mgr/dashboard/server_port 8443
+systemctl restart ceph-mgr@ceph-node1
+
+#生成并安装自签名证书:
+# ceph dashboard create-self-signed-cert
+Self-signed certificate created
+
+创建具有管理员角色的用户:
+# ceph dashboard set-login-credentials admin admin
+Username and password updated
+
+查看是否开启dashboard
+# ceph mgr services
+{
+"dashboard": "https://node1:8443/",
+}
+
+
+
+
